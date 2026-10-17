@@ -1,0 +1,138 @@
+<?xml version="1.0"?>
+<FanControlConfigV2 xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <!--
+    FALLBACK STUB for NoteBook FanControl.
+
+    paveconel (github.com/hrkcz001/paveconel) is the primary fan controller on this
+    machine: this board's EC automatic fan control is unreliable (observed holding both
+    fans at 0 RPM while the CPU climbed past 86 C at idle), so a running software loop is
+    required. This profile exists only so NBFC has a valid and SAFE config to load.
+
+    Verified on this board (Quanta G35D, BIOS F.35):
+      0x2C / 0x2D  fan duty write, CPU-side / GPU-side, 0-100; 255 hands control back to the EC
+      0x2E / 0x2F  fan duty read-back (applied duty saturates ~73-74 even when 100 is written)
+      0xB0:B1 / 0xB2:B3  fan tacho, 16-bit little-endian
+      0x62         manual fan control: 6 = on, 0 = auto
+      0x5A         true CPU temperature; 0xB7 = GPU temperature (reads 0 while the dGPU sleeps)
+      No register unlocks more than ~3650 RPM; 0xEC, 0xF4 and 0x34/0x35 are all inert.
+  -->
+  <NotebookModel>HP Pavilion Gaming 15-ec1xxx (BIOS F.35)</NotebookModel>
+  <Author>fallback stub - primary controller is paveconel</Author>
+  <EcPollInterval>1000</EcPollInterval>
+  <ReadWriteWords>false</ReadWriteWords>
+  <CriticalTemperature>90</CriticalTemperature>
+  <FanConfigurations>
+    <FanConfiguration>
+      <ReadRegister>46</ReadRegister>
+      <WriteRegister>44</WriteRegister>
+      <MinSpeedValue>0</MinSpeedValue>
+      <MaxSpeedValue>100</MaxSpeedValue>
+      <IndependentReadMinMaxValues>true</IndependentReadMinMaxValues>
+      <MinSpeedValueRead>0</MinSpeedValueRead>
+      <MaxSpeedValueRead>100</MaxSpeedValueRead>
+      <ResetRequired>true</ResetRequired>
+      <FanSpeedResetValue>255</FanSpeedResetValue>
+      <FanDisplayName>CPU-side fan (0x2C / 0x2E)</FanDisplayName>
+      <TemperatureThresholds>
+        <TemperatureThreshold>
+          <UpThreshold>0</UpThreshold>
+          <DownThreshold>0</DownThreshold>
+          <FanSpeed>0</FanSpeed>
+        </TemperatureThreshold>
+        <TemperatureThreshold>
+          <UpThreshold>45</UpThreshold>
+          <DownThreshold>40</DownThreshold>
+          <FanSpeed>25</FanSpeed>
+        </TemperatureThreshold>
+        <TemperatureThreshold>
+          <UpThreshold>55</UpThreshold>
+          <DownThreshold>48</DownThreshold>
+          <FanSpeed>40</FanSpeed>
+        </TemperatureThreshold>
+        <TemperatureThreshold>
+          <UpThreshold>65</UpThreshold>
+          <DownThreshold>56</DownThreshold>
+          <FanSpeed>55</FanSpeed>
+        </TemperatureThreshold>
+        <TemperatureThreshold>
+          <UpThreshold>75</UpThreshold>
+          <DownThreshold>64</DownThreshold>
+          <FanSpeed>75</FanSpeed>
+        </TemperatureThreshold>
+        <TemperatureThreshold>
+          <UpThreshold>85</UpThreshold>
+          <DownThreshold>74</DownThreshold>
+          <FanSpeed>90</FanSpeed>
+        </TemperatureThreshold>
+        <TemperatureThreshold>
+          <UpThreshold>90</UpThreshold>
+          <DownThreshold>84</DownThreshold>
+          <FanSpeed>100</FanSpeed>
+        </TemperatureThreshold>
+      </TemperatureThresholds>
+      <FanSpeedPercentageOverrides />
+    </FanConfiguration>
+    <FanConfiguration>
+      <ReadRegister>47</ReadRegister>
+      <WriteRegister>45</WriteRegister>
+      <MinSpeedValue>0</MinSpeedValue>
+      <MaxSpeedValue>100</MaxSpeedValue>
+      <IndependentReadMinMaxValues>true</IndependentReadMinMaxValues>
+      <MinSpeedValueRead>0</MinSpeedValueRead>
+      <MaxSpeedValueRead>100</MaxSpeedValueRead>
+      <ResetRequired>true</ResetRequired>
+      <FanSpeedResetValue>255</FanSpeedResetValue>
+      <FanDisplayName>GPU-side fan (0x2D / 0x2F)</FanDisplayName>
+      <TemperatureThresholds>
+        <TemperatureThreshold>
+          <UpThreshold>0</UpThreshold>
+          <DownThreshold>0</DownThreshold>
+          <FanSpeed>0</FanSpeed>
+        </TemperatureThreshold>
+        <TemperatureThreshold>
+          <UpThreshold>45</UpThreshold>
+          <DownThreshold>40</DownThreshold>
+          <FanSpeed>25</FanSpeed>
+        </TemperatureThreshold>
+        <TemperatureThreshold>
+          <UpThreshold>55</UpThreshold>
+          <DownThreshold>48</DownThreshold>
+          <FanSpeed>40</FanSpeed>
+        </TemperatureThreshold>
+        <TemperatureThreshold>
+          <UpThreshold>65</UpThreshold>
+          <DownThreshold>56</DownThreshold>
+          <FanSpeed>55</FanSpeed>
+        </TemperatureThreshold>
+        <TemperatureThreshold>
+          <UpThreshold>75</UpThreshold>
+          <DownThreshold>64</DownThreshold>
+          <FanSpeed>75</FanSpeed>
+        </TemperatureThreshold>
+        <TemperatureThreshold>
+          <UpThreshold>85</UpThreshold>
+          <DownThreshold>74</DownThreshold>
+          <FanSpeed>90</FanSpeed>
+        </TemperatureThreshold>
+        <TemperatureThreshold>
+          <UpThreshold>90</UpThreshold>
+          <DownThreshold>84</DownThreshold>
+          <FanSpeed>100</FanSpeed>
+        </TemperatureThreshold>
+      </TemperatureThresholds>
+      <FanSpeedPercentageOverrides />
+    </FanConfiguration>
+  </FanConfigurations>
+  <RegisterWriteConfigurations>
+    <RegisterWriteConfiguration>
+      <WriteMode>Set</WriteMode>
+      <WriteOccasion>OnInitialization</WriteOccasion>
+      <Register>98</Register>
+      <Value>6</Value>
+      <ResetRequired>true</ResetRequired>
+      <ResetValue>0</ResetValue>
+      <ResetWriteMode>Set</ResetWriteMode>
+      <Description>OMCC (0x62): enable EC manual fan control on init; restore EC auto mode (0x00) when the service stops</Description>
+    </RegisterWriteConfiguration>
+  </RegisterWriteConfigurations>
+</FanControlConfigV2>

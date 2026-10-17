@@ -1,0 +1,46 @@
+# paveconel configuration. Copy to `paveconel.toml` next to the exe.
+#
+# Fan curves are FUNCTIONS of temperature, not step tables. `T` is the temperature
+# in Celsius; the result is the fan duty in percent, clamped to [min_duty, max_duty].
+# The expression is evaluated with evalexpr, so ordinary arithmetic works:
+#   + - * / % ^ , parentheses, and functions like min(...) / max(...).
+
+poll_interval_ms = 1000
+
+[fan]
+# true = drive BOTH fans from the hotter of the two sensors instead of giving each
+# fan its own curve on its own sensor. Off by default: the CPU and GPU fans are
+# driven independently on this board.
+unify = false
+
+[fan.cpu]
+# ~25% at 60 C, ~52% at 70 C, 100% at 80 C
+function = "(T - 45) * (T - 45) / 12"
+min_duty = 25.0
+max_duty = 100.0
+
+[fan.gpu]
+# The GPU sensor (0xB7) reads 0 while the dGPU sleeps (P8); the loop then falls
+# back to the CPU temperature, so this curve is safe to keep identical.
+function = "(T - 45) * (T - 45) / 12"
+min_duty = 25.0
+max_duty = 100.0
+
+[safety]
+critical_temp = 90.0   # at/above this: force 100% on both fans
+max_safe_temp = 100.0  # at/above this: force 100% and log an ALARM
+stall_rpm = 700        # warn if a fan is commanded >= 30% but tacho reports below this
+
+[ec]
+# I/O-port backend. "winring0" is the only one implemented today; an inpoutx64
+# backend slots in behind the same trait without touching the EC protocol.
+driver = "winring0"
+
+[on_exit]
+# What to write to the EC when control stops:
+#   "auto"     -> hand control back to the EC  (0x2C=0xFF, 0x2D=0xFF, 0x62=0x00)
+#   "max_fans" -> latch manual control and leave both fans at 100%
+#   "keep"     -> leave whatever the loop last wrote
+# Default is "max_fans": this board's native automatic fan control is broken, so
+# handing control back to it can leave the fans stopped.
+policy = "max_fans"
