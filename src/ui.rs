@@ -312,8 +312,8 @@ fn update_tray_tooltip(hwnd: HWND, state: &AppState) {
         format!("GPU {} C", t.gpu_temp)
     };
     let text = format!(
-        "CPU {} C | {} | duty {}%/{}\u{25} | fans {} / {} rpm",
-        t.cpu_temp, gpu, t.cpu_set, t.gpu_set, t.cpu_rpm, t.gpu_rpm
+        "CPU {} C | {} | fans {} / {} rpm",
+        t.cpu_temp, gpu, t.cpu_rpm, t.gpu_rpm
     );
     // Re-apply the emoji only when the band changes; a plain tooltip refresh leaves the
     // icon alone (no NIF_ICON) so the shell is not asked to reload it every second.
