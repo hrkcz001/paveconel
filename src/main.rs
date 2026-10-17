@@ -26,7 +26,7 @@ mod service;
 mod state;
 mod ui;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::Arc;
 
@@ -51,8 +51,8 @@ fn usage() -> ! {
 USAGE:
   paveconel [--hidden]           tray client (default); --hidden starts without the window
   paveconel service              run as a Windows service (started by the SCM)
-  paveconel install-service      register the service (sc create, start= auto)
-  paveconel uninstall-service    remove the service
+  paveconel install-service      install the WinRing0 driver + service (run as admin)
+  paveconel uninstall-service    remove the service and the driver
   paveconel install-tray         start the tray automatically at logon
   paveconel uninstall-tray       stop starting the tray at logon
 
@@ -74,8 +74,8 @@ fn open_backend(driver: &str) -> Box<dyn IoBackend> {
         Ok(io) => io,
         Err(e) => {
             eprintln!("error: {e}");
-            eprintln!("  expects the `WinRing0_1_2_0` service to be running");
-            eprintln!("  (provided by the WinRing0 driver NoteBook FanControl installs)");
+            eprintln!("  expects the WinRing0 kernel driver to be loaded");
+            eprintln!("  (run `paveconel install-service` as admin to install it)");
             exit(1);
         }
     }
@@ -110,6 +110,25 @@ fn run_checked(program: &str, args: &[String]) -> bool {
 
 fn install_service() -> ! {
     let exe = current_exe();
+    let dir = Path::new(&exe)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+
+    if !install_driver(&dir) {
+        eprintln!("error: could not install the WinRing0 kernel driver; fan control needs it");
+        exit(1);
+    }
+
+    // Replace any previous registration so this command is safe to re-run.
+    let _ = std::process::Command::new("sc")
+        .args(["stop", service::SERVICE_NAME])
+        .status();
+    let _ = std::process::Command::new("sc")
+        .args(["delete", service::SERVICE_NAME])
+        .status();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
     let ok = run_checked(
         "sc",
         &[
@@ -124,8 +143,10 @@ fn install_service() -> ! {
         ],
     );
     if ok {
-        println!("service '{0}' registered. Start it with: sc start {0}", service::SERVICE_NAME);
-        println!("(it will also start automatically at boot)");
+        println!(
+            "registered the WinRing0 driver and the '{}' service; it starts at boot",
+            service::SERVICE_NAME
+        );
     }
     exit(if ok { 0 } else { 1 })
 }
@@ -136,10 +157,71 @@ fn uninstall_service() -> ! {
         .args(["stop", service::SERVICE_NAME])
         .status();
     let ok = run_checked("sc", &["delete".into(), service::SERVICE_NAME.into()]);
+    uninstall_driver();
     exit(if ok { 0 } else { 1 })
 }
 
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+
+/// Name of the WinRing0 kernel service. The driver creates `\\.\WinRing0_1_2_0`, which is
+/// what [`crate::ec`] opens, so this name has to match.
+const DRIVER_SERVICE: &str = "WinRing0_1_2_0";
+const DRIVER_FILE: &str = "WinRing0x64.sys";
+
+/// Install the bundled WinRing0 kernel driver as its own service.
+///
+/// The driver is BSD-licensed and ships next to the executable, so paveconel no longer needs
+/// NoteBook FanControl to have installed it. An existing registration is replaced on purpose:
+/// that repoints a stale install (for example one left behind by NBFC) at our copy.
+fn install_driver(exe_dir: &Path) -> bool {
+    let driver = exe_dir.join(DRIVER_FILE);
+    if !driver.exists() {
+        eprintln!("error: {DRIVER_FILE} is missing next to the executable");
+        return false;
+    }
+
+    // `sc` wants a native path for a kernel driver's binPath.
+    let bin_path = format!(r"\??\{}", driver.display());
+    let _ = std::process::Command::new("sc")
+        .args(["stop", DRIVER_SERVICE])
+        .status();
+    let _ = std::process::Command::new("sc")
+        .args(["delete", DRIVER_SERVICE])
+        .status();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let created = run_checked(
+        "sc",
+        &[
+            "create".into(),
+            DRIVER_SERVICE.into(),
+            "type=".into(),
+            "kernel".into(),
+            "start=".into(),
+            "system".into(),
+            "binPath=".into(),
+            bin_path,
+            "DisplayName=".into(),
+            "WinRing0 (paveconel)".into(),
+        ],
+    );
+    if created {
+        // A system-start driver is usually already loaded; a failure here is not fatal.
+        let _ = std::process::Command::new("sc")
+            .args(["start", DRIVER_SERVICE])
+            .status();
+    }
+    created
+}
+
+fn uninstall_driver() {
+    let _ = std::process::Command::new("sc")
+        .args(["stop", DRIVER_SERVICE])
+        .status();
+    let _ = std::process::Command::new("sc")
+        .args(["delete", DRIVER_SERVICE])
+        .status();
+}
 
 fn install_tray() -> ! {
     let exe = current_exe();
