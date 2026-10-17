@@ -64,15 +64,36 @@ The executable's icon is compiled from `assets/paveconel.ico` by `build.rs` thro
 
 ## Install
 
+paveconel ships its own copy of the WinRing0 kernel driver, so NoteBook FanControl is not
+required. Run these from an **elevated** shell:
+
 ```
-paveconel.exe install-service    # register the service (start= auto)
+paveconel.exe install-service    # WinRing0 driver + the service (start= auto)
 sc start paveconel               # or reboot: it comes up on its own
 paveconel.exe install-tray       # start the tray automatically at logon
 ```
 
+`install-service` registers the bundled driver as the `WinRing0_1_2_0` kernel service,
+pointed at the driver sitting next to the executable, and replaces any previous registration
+of either the driver or the service — so it is safe to re-run. `uninstall-service` removes
+both.
+
 The tray autostarts at logon rather than with the service because a Windows service runs in
-session 0 and cannot own a notification-area icon. `uninstall-service` and `uninstall-tray`
-undo both.
+session 0 and cannot own a notification-area icon. `uninstall-tray` undoes that.
+
+> WinRing0 is on Microsoft's vulnerable-driver blocklist, so on a system where that list is
+> enforced the driver will not load. It works on the target machine.
+
+### Scoop
+
+```
+scoop bucket add hrkcz001 https://github.com/hrkcz001/scoop_bucket
+scoop install hrkcz001/paveconel
+sudo paveconel install-service   # driver + service, needs admin once
+paveconel install-tray
+```
+
+Scoop installs the files per-user; the kernel driver and the service need one elevated run.
 
 ## Usage
 
