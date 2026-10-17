@@ -120,30 +120,51 @@ fn install_service() -> ! {
         exit(1);
     }
 
-    // Replace any previous registration so this command is safe to re-run.
-    let _ = std::process::Command::new("sc")
-        .args(["stop", service::SERVICE_NAME])
-        .status();
-    let _ = std::process::Command::new("sc")
-        .args(["delete", service::SERVICE_NAME])
-        .status();
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Repoint (don't delete) an existing registration. Deleting a running service leaves the
+    // name marked for deletion (1072) for as long as any client - the tray polls the SCM
+    // every second - still holds a handle on it, so `sc create` after a delete can fail.
+    let bin_path = format!("\"{exe}\" service");
+    let exists = service_registered(service::SERVICE_NAME);
+    let ok = if exists {
+        run_checked(
+            "sc",
+            &[
+                "config".into(),
+                service::SERVICE_NAME.into(),
+                "binPath=".into(),
+                bin_path,
+                "start=".into(),
+                "auto".into(),
+                "DisplayName=".into(),
+                service::SERVICE_DISPLAY.into(),
+            ],
+        )
+    } else {
+        run_checked(
+            "sc",
+            &[
+                "create".into(),
+                service::SERVICE_NAME.into(),
+                "binPath=".into(),
+                bin_path,
+                "start=".into(),
+                "auto".into(),
+                "DisplayName=".into(),
+                service::SERVICE_DISPLAY.into(),
+            ],
+        )
+    };
 
-    let ok = run_checked(
-        "sc",
-        &[
-            "create".into(),
-            service::SERVICE_NAME.into(),
-            "binPath=".into(),
-            format!("\"{exe}\" service"),
-            "start=".into(),
-            "auto".into(),
-            "DisplayName=".into(),
-            service::SERVICE_DISPLAY.into(),
-        ],
-    );
     if ok {
-        // Bring it up now; a system-start service also comes up on its own at boot.
+        // Restart if it was running so a changed binPath takes effect, otherwise just start.
+        if exists {
+            let _ = std::process::Command::new("sc")
+                .args(["stop", service::SERVICE_NAME])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
         let _ = std::process::Command::new("sc")
             .args(["start", service::SERVICE_NAME])
             .stdout(std::process::Stdio::null())
@@ -151,6 +172,12 @@ fn install_service() -> ! {
             .status();
         println!(
             "registered the WinRing0 driver and the '{}' service; it starts at boot",
+            service::SERVICE_NAME
+        );
+    } else {
+        eprintln!(
+            "error: could not register the '{}' service. If an earlier run left it marked for\n\
+             deletion, close other paveconel processes or reboot, then retry.",
             service::SERVICE_NAME
         );
     }
