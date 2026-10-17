@@ -143,6 +143,12 @@ fn install_service() -> ! {
         ],
     );
     if ok {
+        // Bring it up now; a system-start service also comes up on its own at boot.
+        let _ = std::process::Command::new("sc")
+            .args(["start", service::SERVICE_NAME])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
         println!(
             "registered the WinRing0 driver and the '{}' service; it starts at boot",
             service::SERVICE_NAME
@@ -168,11 +174,26 @@ const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 const DRIVER_SERVICE: &str = "WinRing0_1_2_0";
 const DRIVER_FILE: &str = "WinRing0x64.sys";
 
+/// Whether the service is registered. `sc qc` exits non-zero when it is not.
+fn service_registered(name: &str) -> bool {
+    std::process::Command::new("sc")
+        .args(["qc", name])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 /// Install the bundled WinRing0 kernel driver as its own service.
 ///
-/// The driver is BSD-licensed and ships next to the executable, so paveconel no longer needs
-/// NoteBook FanControl to have installed it. An existing registration is replaced on purpose:
-/// that repoints a stale install (for example one left behind by NBFC) at our copy.
+/// The driver is BSD-licensed and ships next to the executable, so paveconel does not need
+/// NoteBook FanControl to have installed it.
+///
+/// An existing registration is *repointed*, never deleted: a loaded kernel driver cannot be
+/// stopped (`sc stop` fails with 1061), and deleting it leaves the service name marked for
+/// deletion, so `sc create` then fails with 1072 until the machine reboots. `sc config` only
+/// changes the registry and a loaded instance picks the new path up on the next boot.
 fn install_driver(exe_dir: &Path) -> bool {
     let driver = exe_dir.join(DRIVER_FILE);
     if !driver.exists() {
@@ -182,36 +203,59 @@ fn install_driver(exe_dir: &Path) -> bool {
 
     // `sc` wants a native path for a kernel driver's binPath.
     let bin_path = format!(r"\??\{}", driver.display());
-    let _ = std::process::Command::new("sc")
-        .args(["stop", DRIVER_SERVICE])
-        .status();
-    let _ = std::process::Command::new("sc")
-        .args(["delete", DRIVER_SERVICE])
-        .status();
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    let already = service_registered(DRIVER_SERVICE);
 
-    let created = run_checked(
-        "sc",
-        &[
-            "create".into(),
-            DRIVER_SERVICE.into(),
-            "type=".into(),
-            "kernel".into(),
-            "start=".into(),
-            "system".into(),
-            "binPath=".into(),
-            bin_path,
-            "DisplayName=".into(),
-            "WinRing0 (paveconel)".into(),
-        ],
-    );
-    if created {
-        // A system-start driver is usually already loaded; a failure here is not fatal.
-        let _ = std::process::Command::new("sc")
-            .args(["start", DRIVER_SERVICE])
-            .status();
+    let ok = if already {
+        run_checked(
+            "sc",
+            &[
+                "config".into(),
+                DRIVER_SERVICE.into(),
+                "binPath=".into(),
+                bin_path,
+                "start=".into(),
+                "system".into(),
+            ],
+        )
+    } else {
+        run_checked(
+            "sc",
+            &[
+                "create".into(),
+                DRIVER_SERVICE.into(),
+                "type=".into(),
+                "kernel".into(),
+                "start=".into(),
+                "system".into(),
+                "binPath=".into(),
+                bin_path,
+                "DisplayName=".into(),
+                "WinRing0 (paveconel)".into(),
+            ],
+        )
+    };
+
+    if !ok {
+        eprintln!(
+            "error: could not register the '{DRIVER_SERVICE}' driver.\n\
+             If an earlier run left it marked for deletion, reboot and run this again."
+        );
+        return false;
     }
-    created
+
+    // Load it now if it is not loaded. A system-start driver is usually already up, in which
+    // case this returns "already running" - harmless, and the path above applies next boot.
+    let _ = std::process::Command::new("sc")
+        .args(["start", DRIVER_SERVICE])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    println!("WinRing0 driver registered at {}", driver.display());
+    if already {
+        println!("  (an already-loaded driver switches to this path on the next reboot)");
+    }
+    true
 }
 
 fn uninstall_driver() {
@@ -221,6 +265,7 @@ fn uninstall_driver() {
     let _ = std::process::Command::new("sc")
         .args(["delete", DRIVER_SERVICE])
         .status();
+    println!("WinRing0 driver removed (a loaded one goes away on the next reboot)");
 }
 
 fn install_tray() -> ! {

@@ -19,8 +19,8 @@ use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT,
 use windows_sys::Win32::Graphics::Gdi::COLOR_WINDOW;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW,
+    Shell_NotifyIconW, ShellExecuteW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD,
+    NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -202,10 +202,13 @@ fn refresh(hwnd: HWND, state: &AppState) {
         set_label(hwnd, ID_GPU, "");
         set_label(hwnd, ID_RPM, "");
         set_label(hwnd, ID_DUTY, "");
-        set_label(hwnd, ID_MODE, "start it with: sc start paveconel");
+        set_label(hwnd, ID_MODE, "");
         set_label(hwnd, ID_FN_CUR, "");
+        set_label(hwnd, ID_KILL_SVC, "Start Service");
         return;
     }
+
+    set_label(hwnd, ID_KILL_SVC, "Kill Service");
 
     let t = state.snapshot();
     let gpu = if t.gpu_temp == 0 {
@@ -370,6 +373,27 @@ fn show_tray_menu(hwnd: HWND) {
     }
 }
 
+/// Start the service through the SCM.
+///
+/// The tray is not elevated, so a plain `sc start` would be refused; ShellExecute with the
+/// "runas" verb lets Windows decide whether to prompt.
+fn start_service_elevated() -> bool {
+    let verb = wide("runas");
+    let file = wide("sc.exe");
+    let args = wide(&format!("start {}", service::SERVICE_NAME));
+    let rc = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            args.as_ptr(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    rc as isize > 32
+}
+
 fn handle_command(hwnd: HWND, cmd: usize) {
     let Some(state) = (unsafe { app(hwnd) }) else {
         return;
@@ -411,20 +435,33 @@ fn handle_command(hwnd: HWND, cmd: usize) {
             DestroyWindow(hwnd);
         },
         _ if id == ID_KILL_SVC => {
-            // The service stops itself through the SCM; the tray only asks.
-            let stopped = match state.client.lock().unwrap().as_ref() {
-                Some(c) => c.stop_service().is_ok(),
-                None => false,
-            };
-            set_label(
-                hwnd,
-                ID_RESULT,
-                if stopped {
-                    "result: stopping service, fans -> EC auto"
-                } else {
-                    "result: cannot reach the service"
-                },
-            );
+            if state.running.load(Ordering::SeqCst) {
+                // The service stops itself through the SCM; the tray only asks.
+                let stopped = match state.client.lock().unwrap().as_ref() {
+                    Some(c) => c.stop_service().is_ok(),
+                    None => false,
+                };
+                set_label(
+                    hwnd,
+                    ID_RESULT,
+                    if stopped {
+                        "result: stopping service, fans -> EC auto"
+                    } else {
+                        "result: cannot reach the service"
+                    },
+                );
+            } else {
+                let started = start_service_elevated();
+                set_label(
+                    hwnd,
+                    ID_RESULT,
+                    if started {
+                        "result: starting the service"
+                    } else {
+                        "result: could not start the service"
+                    },
+                );
+            }
         },
         _ if id == ID_APPLY => {
             let f = get_text(hwnd, ID_FN_EDIT);
