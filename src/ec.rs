@@ -26,10 +26,8 @@ use crate::regs::{EC_CMD, EC_DATA, EC_IBF, EC_OBF, EC_READ, EC_WRITE};
 /// another implementation of this trait - the EC protocol and all control logic stay
 /// untouched.
 pub trait IoBackend {
-    fn read_port(&self, port: u16) -> u8;
-    fn write_port(&self, port: u16, value: u8);
-    /// Raw read returning `(value, win32 error code or 0)` - for diagnostics.
-    fn raw_read(&self, port: u16) -> (u8, i32);
+    fn read_port(&self, port: u16) -> io::Result<u8>;
+    fn write_port(&self, port: u16, value: u8) -> io::Result<()>;
     #[allow(dead_code)] // part of the backend API surface; used for diagnostics
     fn name(&self) -> &'static str;
 }
@@ -53,10 +51,12 @@ fn wide(s: &str) -> Vec<u16> {
 /// Handle to the WinRing0 driver device. One instance per process is enough.
 pub struct WinRing0 {
     handle: HANDLE,
+    _owner: crate::ownership::Owner,
 }
 
 impl WinRing0 {
     pub fn open() -> io::Result<Self> {
+        let owner = crate::ownership::Owner::acquire()?;
         let path = wide(DEVICE);
         let handle = unsafe {
             CreateFileW(
@@ -72,16 +72,12 @@ impl WinRing0 {
         if handle == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
         }
-        Ok(WinRing0 { handle })
+        Ok(WinRing0 { handle, _owner: owner })
     }
 }
 
 impl IoBackend for WinRing0 {
-    fn read_port(&self, port: u16) -> u8 {
-        self.raw_read(port).0
-    }
-
-    fn raw_read(&self, port: u16) -> (u8, i32) {
+    fn read_port(&self, port: u16) -> io::Result<u8> {
         // Driver reads the low byte(s) of this buffer as the port number.
         let mut port_in: u32 = port as u32;
         let mut value: u8 = 0;
@@ -98,15 +94,12 @@ impl IoBackend for WinRing0 {
                 std::ptr::null_mut(),
             )
         };
-        let err = if ok == 0 {
-            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
-        } else {
-            0
-        };
-        (value, err)
+        if ok == 0 { return Err(io::Error::last_os_error()); }
+        validate_read_length(returned)?;
+        Ok(value)
     }
 
-    fn write_port(&self, port: u16, value: u8) {
+    fn write_port(&self, port: u16, value: u8) -> io::Result<()> {
         #[repr(C)]
         struct WriteIoPortInput {
             port: u32,
@@ -129,9 +122,9 @@ impl IoBackend for WinRing0 {
                 std::ptr::null_mut(),
             )
         };
-        if ok == 0 {
-            eprintln!("warn: WriteIoPort(0x{port:02X}, 0x{value:02X}) failed: {}", io::Error::last_os_error());
-        }
+        if ok == 0 { return Err(io::Error::last_os_error()); }
+        if returned != 0 { return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected write response length")); }
+        Ok(())
     }
 
     fn name(&self) -> &'static str {
@@ -156,111 +149,94 @@ pub fn open(driver: &str) -> io::Result<Box<dyn IoBackend>> {
     }
 }
 
-/// Embedded-controller byte read/write over an [`IoBackend`].
-pub struct Ec<'a> {
-    io: &'a dyn IoBackend,
-    verbose: bool,
+fn validate_read_length(returned: u32) -> io::Result<()> {
+    if returned != 1 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "short/invalid WinRing0 read response"));
+    }
+    Ok(())
 }
 
+/// One EC session. Any transport error latches it permanently: no retries or exit writes.
+/// A new session is NOT a recovery procedure for a partially sent command.
+pub struct Ec<'a> {
+    io: &'a dyn IoBackend,
+    faulted: std::cell::Cell<bool>,
+}
+const POLL_LIMIT: usize = 10_000;
 impl<'a> Ec<'a> {
     pub fn new(io: &'a dyn IoBackend) -> Self {
-        Ec {
-            io,
-            verbose: std::env::var("PAVECONEL_DEBUG").is_ok(),
-        }
+        Self { io, faulted: std::cell::Cell::new(false) }
     }
-
-    fn status(&self) -> u8 {
-        self.io.read_port(EC_CMD)
+    pub fn is_faulted(&self) -> bool { self.faulted.get() }
+    fn transaction<T>(&self, f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        if self.is_faulted() { return Err(io::Error::other("EC transport fault latched; no further I/O allowed")); }
+        // Latch before touching hardware, including in the event of panic unwind.
+        self.faulted.set(true);
+        let result = f();
+        if result.is_ok() { self.faulted.set(false); }
+        result
     }
-
-    /// Wait until the EC input buffer is free (IBF bit clear) - ready to accept a byte.
-    fn wait_write(&self) -> bool {
-        for _ in 0..10_000 {
-            if self.status() & EC_IBF == 0 {
-                return true;
-            }
+    fn wait(&self, mask: u8, set: bool, phase: &str) -> io::Result<()> {
+        for _ in 0..POLL_LIMIT {
+            if (self.io.read_port(EC_CMD)? & mask != 0) == set { return Ok(()); }
+            std::hint::spin_loop();
         }
-        false
+        Err(io::Error::new(io::ErrorKind::TimedOut, phase.to_string()))
     }
-
-    /// Wait until the EC output buffer is full (OBF bit set) - data ready to read.
-    fn wait_read(&self) -> bool {
-        for _ in 0..10_000 {
-            if self.status() & EC_OBF != 0 {
-                return true;
-            }
-        }
-        false
+    pub fn read(&self, reg: u8) -> io::Result<u8> {
+        self.transaction(|| {
+            self.wait(EC_IBF, false, "read: before command")?;
+            self.io.write_port(EC_CMD, EC_READ)?;
+            self.wait(EC_IBF, false, "read: before address")?;
+            self.io.write_port(EC_DATA, reg)?;
+            self.wait(EC_IBF, false, "read: after address")?;
+            self.wait(EC_OBF, true, "read: awaiting data")?;
+            self.io.read_port(EC_DATA)
+        })
     }
-
-    pub fn read(&self, reg: u8) -> Option<u8> {
-        let dbg = self.verbose;
-        if dbg {
-            eprintln!("read 0x{reg:02X}: status0=0x{:02X}", self.status());
-        }
-        if !self.wait_write() {
-            if dbg {
-                eprintln!("  wait_write #1 FAILED status=0x{:02X}", self.status());
-            }
-            return None;
-        }
-        self.io.write_port(EC_CMD, EC_READ);
-        if dbg {
-            eprintln!("  wrote cmd 0x80 -> 0x66; status=0x{:02X}", self.status());
-        }
-        if !self.wait_write() {
-            if dbg {
-                eprintln!("  wait_write #2 FAILED status=0x{:02X}", self.status());
-            }
-            return None;
-        }
-        self.io.write_port(EC_DATA, reg);
-        if dbg {
-            eprintln!("  wrote addr 0x{reg:02X} -> 0x62; status=0x{:02X}", self.status());
-        }
-        let ww = self.wait_write();
-        let wr = self.wait_read();
-        if dbg {
-            eprintln!("  wait_write={ww} wait_read={wr} status=0x{:02X}", self.status());
-        }
-        if !(ww && wr) {
-            return None;
-        }
-        let v = self.io.read_port(EC_DATA);
-        if dbg {
-            eprintln!("  value=0x{v:02X}");
-        }
-        Some(v)
+    pub fn write(&self, reg: u8, val: u8) -> io::Result<()> {
+        self.transaction(|| {
+            self.wait(EC_IBF, false, "write: before command")?;
+            self.io.write_port(EC_CMD, EC_WRITE)?;
+            self.wait(EC_IBF, false, "write: before address")?;
+            self.io.write_port(EC_DATA, reg)?;
+            self.wait(EC_IBF, false, "write: before value")?;
+            self.io.write_port(EC_DATA, val)?;
+            self.wait(EC_IBF, false, "write: completion")
+        })
     }
-
-    pub fn write(&self, reg: u8, val: u8) {
-        if !self.wait_write() {
-            return;
-        }
-        self.io.write_port(EC_CMD, EC_WRITE);
-        if !self.wait_write() {
-            return;
-        }
-        self.io.write_port(EC_DATA, reg);
-        if !self.wait_write() {
-            return;
-        }
-        self.io.write_port(EC_DATA, val);
+    pub fn read_all(&self) -> io::Result<[u8; 256]> {
+        let mut buf = [0; 256];
+        for (i,b) in buf.iter_mut().enumerate() { *b = self.read(i as u8)?; }
+        Ok(buf)
     }
-
-    pub fn read_all(&self) -> [u8; 256] {
-        let mut buf = [0u8; 256];
-        for (i, b) in buf.iter_mut().enumerate() {
-            *b = self.read(i as u8).unwrap_or(0);
-        }
-        buf
-    }
-
-    /// 16-bit little-endian word starting at `lo`; `None` if either byte read failed.
-    pub fn read_word(&self, lo: u8) -> Option<u16> {
+    pub fn read_word(&self, lo: u8) -> io::Result<u16> {
         let l = self.read(lo)? as u16;
-        let h = self.read(lo + 1)? as u16;
-        Some(l | (h << 8))
+        Ok(l | ((self.read(lo + 1)? as u16) << 8))
+    }
+}
+
+#[cfg(test)]
+#[path = "ec_tests.rs"]
+mod regression_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    struct Stuck { busy: Cell<bool>, writes: Cell<usize> }
+    impl IoBackend for Stuck {
+        fn read_port(&self, _: u16) -> io::Result<u8> { Ok(if self.busy.get() { EC_IBF } else { 0 }) }
+        fn write_port(&self, _: u16, _: u8) -> io::Result<()> { self.writes.set(self.writes.get()+1); Ok(()) }
+        fn name(&self) -> &'static str { "fake" }
+    }
+    #[test]
+    fn timeout_latches_and_prevents_further_writes() {
+        let io = Stuck { busy: Cell::new(true), writes: Cell::new(0) };
+        let ec = Ec::new(&io);
+        assert!(ec.read(0x5a).is_err());
+        io.busy.set(false);
+        assert!(ec.write(0x2c, 100).is_err());
+        assert_eq!(io.writes.get(), 0, "failed transport must never resume I/O");
     }
 }

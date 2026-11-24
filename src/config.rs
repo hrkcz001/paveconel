@@ -36,8 +36,8 @@ pub struct Config {
     pub cpu: FanCurve,
     pub gpu: FanCurve,
     /// Drive both fans from the single hotter of the two sensors instead of giving each
-    /// fan its own curve on its own sensor. Off by default: the CPU and GPU fans are
-    /// independently driven on this board.
+    /// fan its own curve on its own sensor. On by default: the user wants both fans to
+    /// follow the hotter sensor so the whole region cools as one unit.
     pub unify_fans: bool,
     pub safety: Safety,
     /// Which I/O-port backend to use (`winring0` today).
@@ -64,7 +64,7 @@ impl Default for Config {
                 min_duty: 25.0,
                 max_duty: 100.0,
             },
-            unify_fans: false,
+            unify_fans: true,
             safety: Safety {
                 critical_temp: 90.0,
                 max_safe_temp: 100.0,
@@ -148,6 +148,18 @@ pub fn load(path: &Path) -> Config {
     }
 
     cfg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fans_are_unified_by_default() {
+        assert!(Config::default().unify_fans);
+        let missing = std::env::temp_dir().join("paveconel-missing-default-config.toml");
+        assert!(load(&missing).unify_fans);
+    }
 }
 
 /// Evaluate `curve.function` at temperature `t`, clamped to [min_duty, max_duty].

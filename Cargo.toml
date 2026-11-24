@@ -1,6 +1,6 @@
 [package]
 name = "paveconel"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Pavilion EC Control Panel - embedded-controller fan control for HP Pavilion Gaming 15-ec1xxx"
 
@@ -11,6 +11,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    "Win32_System_Threading",
     "Win32_System_Console",
     "Win32_System_LibraryLoader",
     "Win32_System_Pipes",

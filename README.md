@@ -39,10 +39,10 @@ kernel driver drops in behind the same trait.
 ## Features
 
 - Fan curves as functions of temperature, evaluated with `evalexpr`.
-- **Independent or unified fans.** By default the CPU fan follows the CPU sensor and the GPU
-  fan the GPU sensor; a checkbox drives both from whichever is hotter instead.
+- **Unified fans by default:** both follow the hotter sensor through the CPU curve.
+  Disable the checkbox for independent CPU/GPU curves.
 - Curve mode and EC auto mode, switchable while running.
-- An exit policy applied on every exit path, so the EC is never left in an unintended state.
+- A configured exit policy on graceful exit/unwind with healthy transport; default MaxFans.
 - Tray icon: an emoji picked by the hottest sensor — snowflake, steam or fire — with a live
   tooltip showing temperatures, duty and fan speeds.
 - Control window: live status, curve editor, EC register prober, service lifecycle buttons.
@@ -104,7 +104,7 @@ paveconel status               # one-shot status from the running service
 
 paveconel dump                 # dump all 256 EC bytes      [service stopped]
 paveconel read  0x5A           # read one register          [service stopped]
-paveconel write 0x2C 100       # write one register         [service stopped]
+paveconel write 0x2C 64        # fan register only; hex 64=100% [service stopped]
 paveconel raw   0x66           # raw I/O-port read          [service stopped]
 paveconel restore              # hand fan control to the EC [service stopped]
 paveconel maxfans              # latch manual, fans to 100% [service stopped]
@@ -112,7 +112,12 @@ paveconel monitor [CONFIG]     # headless control loop      [service stopped]
 ```
 
 The bare CLI commands drive the EC directly and are meant for diagnostics while the service is
-stopped — two processes must never drive the EC at once.
+stopped. A global named mutex, held for the entire driver lifetime, refuses a second
+cooperating paveconel owner (service or any direct command, including raw reads).
+Access-denied opening that mutex also fails closed. This does not coordinate with older
+paveconel binaries, NBFC, OmenMon, Windows ACPI, firmware or other port-access tools.
+Stop other controllers before use; never run direct dumps alongside the service.
+Use `status` over the pipe while the service runs.
 
 ## Configuration
 
@@ -121,7 +126,7 @@ resolves the file relative to the binary, not the working directory.
 
 ```toml
 [fan]
-unify = false            # false: each fan follows its own sensor
+unify = true             # default: both follow the hotter sensor through the CPU curve
 
 [fan.cpu]
 function = "(T - 45) * (T - 45) / 12"
@@ -135,13 +140,30 @@ policy = "max_fans"      # auto | max_fans | keep
 ## Safety
 
 - Manual mode is latched for as long as the loop drives the fans. An `ExitGuard` applies the
-  configured exit policy on every exit path, panic unwind included.
+  configured exit policy on graceful return/panic unwind only while transport is healthy.
+  The service STOP command preserves that policy; it no longer forces EC auto.
 - `on_exit.policy`:
   - `auto` — hand the fans back to the EC's own control.
   - `max_fans` — leave both fans at 100 %. The default, because this board's automatic control
     is not dependable.
   - `keep` — leave whatever the loop last wrote.
 - `critical_temp` and `max_safe_temp` force 100 %.
+- I/O errors, malformed WinRing0 read lengths and any handshake timeout latch a transport
+  fault. The loop stops immediately: no blind retry, further transactions or exit-policy
+  writes. A partially sent EC command cannot safely be recovered by another write recipe.
+  Cooling remains at its last successfully applied state, which may be insufficient.
+  Do not blindly restart after a fault; investigate/recover the EC and cooling safely first.
+- Implausible telemetry forces manual maximum cooling, never a lower curve duty. CPU
+  bounds are 10–115 C, GPU 10–110 C (zero permitted for sleeping dGPU), duty 0–100,
+  RPM <=10,000 and mode auto/manual. These broad board-specific checks cannot detect
+  every plausible-but-wrong byte. Firmware/Windows ACPI access can still interleave with
+  our multi-byte protocol; the mutex is NOT an ACPI lock or a fix for that race.
+- Named-pipe raw register writes are disabled (the old prober write action is rejected).
+  Direct CLI writes allow only fan duty registers 0x2C/0x2D (0–100 or 0xFF) and mode
+  0x62 (0 or 6). The existing permissive pipe still allows fan settings and service stop;
+  this change is not full local-client authorization hardening.
+- Hard kills/power loss cannot run the exit guard. Touchpad/power-loss incidents reported
+  alongside garbage EC temperatures have not been root-caused; no hardware cure is claimed.
 - A fan commanded at 30 % or more whose tacho reads 0 RPM is reported as stalled.
 
 ## License

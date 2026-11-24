@@ -9,7 +9,7 @@
 //!     CURVE <expr>       -> "OK\n" | "ERR <why>\n"
 //!     UNIFY on|off       -> "OK\n"
 //!     REG r <NN>         -> "OK <val>\n" | "ERR\n"
-//!     REG w <NN> <MM>    -> "OK <readback>\n" | "ERR\n"
+//!     REG w ...          -> "ERR register writes disabled\n"
 //!     BYE                -> (close)
 //!
 //! Every field is decimal. The curve is the remainder of the line, so it may contain
@@ -200,11 +200,9 @@ fn handle_connection(pipe: HANDLE, shared: &Shared) {
                 reply(pipe, "OK");
             }
             "STOP" => {
-                // The "Kill Service" path: hand the fans back to EC auto on the way out,
-                // rather than the configured latch, then stop through the SCM (this process
-                // is LocalSystem, so it may).
+                // Stop through SCM, preserving the configured cooling exit policy.
                 reply(pipe, "OK");
-                shared.set_exit_auto();
+                // Keep the configured exit policy (MaxFans by default).
                 crate::service::request_self_stop();
             }
             "REG" => {
@@ -221,22 +219,7 @@ fn handle_connection(pipe: HANDLE, shared: &Shared) {
                         }
                         reply(pipe, "ERR");
                     }
-                    (Some("w"), Some(reg), Some(val)) => {
-                        if let (Ok(reg), Ok(val)) = (
-                            u8::from_str_radix(reg.trim_start_matches("0x"), 16),
-                            u8::from_str_radix(val.trim_start_matches("0x"), 16),
-                        ) {
-                            shared.post_reg_request(crate::state::RegRequest {
-                                reg,
-                                write: Some(val),
-                            });
-                            if let Some(rb) = wait_reg(shared, reg) {
-                                reply(pipe, &format!("OK {rb}"));
-                                continue;
-                            }
-                        }
-                        reply(pipe, "ERR");
-                    }
+                    (Some("w"), _, _) => reply(pipe, "ERR register writes disabled"),
                     _ => reply(pipe, "ERR"),
                 }
             }
@@ -263,9 +246,9 @@ fn wait_reg(shared: &Shared, reg: u8) -> Option<u8> {
 /// Named-pipe server. Runs until `stop` is set, serving one connection at a time.
 pub fn run_server(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
     let name = wide(PIPE_NAME);
-    // A NULL DACL is deliberate: the pipe only carries fan-control traffic between the
-    // LocalSystem service and a user-session tray app, and the default DACL of a service
-    // would deny the interactive user. There is nothing secret on this pipe.
+    // Existing permissive local interface: unprivileged clients can change fan settings
+    // and stop the service. Arbitrary register writes are disabled, not made safe by
+    // this DACL. Restricting the remaining fan-control interface is separate work.
     let mut sd: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
     unsafe {
         let p = &mut sd as *mut SECURITY_DESCRIPTOR as *mut core::ffi::c_void;
@@ -396,9 +379,8 @@ impl IpcClient {
     }
 
     pub fn reg_write(&self, reg: u8, val: u8) -> io::Result<Option<u8>> {
-        let r = self.request(&format!("REG w {reg} {val}"))?;
-        Ok(r.strip_prefix("OK ")
-            .and_then(|v| v.parse::<u8>().ok()))
+        let _ = (reg, val);
+        Err(io::Error::new(io::ErrorKind::PermissionDenied, "EC register writes disabled; use fan controls"))
     }
 }
 

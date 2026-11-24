@@ -20,6 +20,7 @@ mod config;
 mod control;
 mod ec;
 mod icons;
+mod ownership;
 mod ipc;
 mod regs;
 mod service;
@@ -58,7 +59,7 @@ USAGE:
 
   paveconel dump                 dump all 256 EC bytes (hex)      [service stopped]
   paveconel read  <REG>          read one register                [service stopped]
-  paveconel write <REG> <VAL>    write one register (raw)         [service stopped]
+  paveconel write <REG> <VAL>    write fan duty/mode register         [service stopped]
   paveconel raw   <PORT>         raw I/O-port read (diagnostics)  [service stopped]
   paveconel restore              hand fan control back to the EC  [service stopped]
   paveconel maxfans              latch manual control, fans 100%  [service stopped]
@@ -372,6 +373,10 @@ fn attach_console() {
     }
 }
 
+fn checked<T>(r: std::io::Result<T>) -> T {
+    r.unwrap_or_else(|e| { eprintln!("error: {e}"); exit(1) })
+}
+
 fn main() {
     attach_console();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -426,7 +431,7 @@ fn main() {
 
     match cmd {
         "dump" => {
-            let buf = ec.read_all();
+            let buf = checked(ec.read_all());
             println!("   | 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F");
             println!("---|------------------------------------------------");
             for row in 0..16 {
@@ -440,9 +445,9 @@ fn main() {
         "read" => {
             let reg = args.get(1).and_then(|s| parse_hex(s)).unwrap_or_else(|| usage());
             match ec.read(reg) {
-                Some(v) => println!("0x{reg:02X} = 0x{v:02X} = {v}"),
-                None => {
-                    eprintln!("error: EC read of 0x{reg:02X} failed (handshake timeout)");
+                Ok(v) => println!("0x{reg:02X} = 0x{v:02X} = {v}"),
+                Err(e) => {
+                    eprintln!("error: EC read of 0x{reg:02X} failed: {e}");
                     exit(1);
                 }
             }
@@ -450,17 +455,21 @@ fn main() {
         "write" => {
             let reg = args.get(1).and_then(|s| parse_hex(s)).unwrap_or_else(|| usage());
             let val = args.get(2).and_then(|s| parse_hex(s)).unwrap_or_else(|| usage());
-            ec.write(reg, val);
+            if !matches!((reg, val), (regs::XSS1 | regs::XSS2, 0..=100 | 255) | (regs::OMCC, 0 | 6)) {
+                eprintln!("error: only fan duty/mode writes are permitted");
+                exit(1);
+            }
+            checked(ec.write(reg, val));
             match ec.read(reg) {
-                Some(v) => println!("wrote 0x{val:02X} -> 0x{reg:02X}; readback 0x{v:02X}"),
-                None => println!("wrote 0x{val:02X} -> 0x{reg:02X}; readback failed"),
+                Ok(v) => println!("wrote 0x{val:02X} -> 0x{reg:02X}; readback 0x{v:02X}"),
+                Err(e) => { eprintln!("write completed, but readback failed: {e}"); exit(1); },
             }
         }
         "raw" => {
             let port = args.get(1).and_then(|s| parse_hex(s)).unwrap_or_else(|| usage());
             for _ in 0..5 {
-                let (v, err) = io.raw_read(port as u16);
-                println!("port 0x{port:02X} -> 0x{v:02X} (err {err})");
+                let v = checked(io.read_port(port as u16));
+                println!("port 0x{port:02X} -> 0x{v:02X}");
                 std::thread::sleep(std::time::Duration::from_millis(250));
             }
         }
@@ -488,10 +497,10 @@ fn main() {
             control::run(io.as_ref(), &cfg, &shared, true);
         }
         "restore" => {
-            control::ExitGuard::new(io.as_ref(), config::ExitPolicy::Auto).apply();
+            checked(control::ExitGuard::new(&ec, config::ExitPolicy::Auto).apply());
             let rb = |reg| match ec.read(reg) {
-                Some(v) => format!("0x{v:02X}"),
-                None => "fail".to_string(),
+                Ok(v) => format!("0x{v:02X}"),
+                Err(e) => format!("fail: {e}"),
             };
             println!(
                 "auto recipe written: 0x2C={} 0x2D={} 0x62={}",
@@ -501,10 +510,10 @@ fn main() {
             );
         }
         "maxfans" => {
-            control::ExitGuard::new(io.as_ref(), config::ExitPolicy::MaxFans).apply();
+            checked(control::ExitGuard::new(&ec, config::ExitPolicy::MaxFans).apply());
             let rb = |reg| match ec.read(reg) {
-                Some(v) => format!("0x{v:02X}"),
-                None => "fail".to_string(),
+                Ok(v) => format!("0x{v:02X}"),
+                Err(e) => format!("fail: {e}"),
             };
             println!(
                 "max-fans recipe written: 0x2C={} 0x2D={} 0x62={}",

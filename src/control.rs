@@ -3,15 +3,20 @@
 //! This unit's EC automatic fan control is unreliable (observed: duty 0 / 0 RPM while
 //! the true CPU temperature climbed past 86 C at idle). A running software loop is
 //! therefore mandatory; the EC is put into manual mode for the duration and restored
-//! to automatic on ANY exit path (see [`RestoreGuard`]).
+//! to the configured exit policy (MaxFans by default) unless the transport has faulted.
 
 use std::cell::Cell;
+use std::io;
 use std::time::Duration;
 
 use crate::config::{self, Config, ExitPolicy};
 use crate::ec::{Ec, IoBackend};
 use crate::regs::*;
 use crate::state::{Mode, Shared};
+
+#[cfg(test)]
+#[path = "control_tests.rs"]
+mod tests;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Telemetry {
@@ -32,10 +37,19 @@ pub struct Telemetry {
 }
 
 impl Telemetry {
-    /// Sample the EC. Returns `None` if any read failed: an EC read timeout yields `None`
-    /// rather than a fake 0, so the control loop never feeds a 0 temperature into the curve.
-    pub fn sample(ec: &Ec) -> Option<Self> {
-        Some(Telemetry {
+    /// Broad board-specific sanity bounds; GPU zero is valid in P8. Plausible but
+    /// incorrect bytes cannot be detected by this filter.
+    pub fn plausible(&self) -> bool {
+        (10..=115).contains(&self.cpu_temp)
+            && (self.gpu_temp == 0 || (10..=110).contains(&self.gpu_temp))
+            && self.cpu_duty <= 100 && self.gpu_duty <= 100
+            && self.cpu_rpm <= 10_000 && self.gpu_rpm <= 10_000
+            && matches!(self.mode, AUTO_MODE | MANUAL_MODE)
+    }
+
+    /// Sample the EC, propagating any error rather than inventing zero telemetry.
+    pub fn sample(ec: &Ec) -> io::Result<Self> {
+        Ok(Telemetry {
             cpu_temp: ec.read(CPU_TEMP)?,
             gpu_temp: ec.read(GPU_TEMP)?,
             cpu_set: 0,
@@ -55,70 +69,75 @@ impl Telemetry {
 }
 
 /// Applies the configured exit policy when dropped. Covers normal return, early `?`, and
-/// panic unwind, so a crash never leaves the EC in an unintended state.
+/// panic unwind. A faulted transport suppresses the recipe; hard kills cannot run Drop.
 pub struct ExitGuard<'a> {
-    io: &'a dyn IoBackend,
-    policy: Cell<ExitPolicy>,
+    ec: &'a Ec<'a>,
+    policy: ExitPolicy,
+    applied: Cell<bool>,
 }
 
 impl<'a> ExitGuard<'a> {
-    pub fn new(io: &'a dyn IoBackend, policy: ExitPolicy) -> Self {
+    pub fn new(ec: &'a Ec<'a>, policy: ExitPolicy) -> Self {
         ExitGuard {
-            io,
-            policy: Cell::new(policy),
+            ec,
+            policy,
+            applied: Cell::new(false),
         }
     }
 
-    /// Override the exit behaviour at the last moment - e.g. a client asked to stop into EC
-    /// auto instead of the configured latch.
-    pub fn set_policy(&self, policy: ExitPolicy) {
-        self.policy.set(policy);
-    }
-
     /// Write the register recipe for the configured exit policy.
-    pub fn apply(&self) {
-        let ec = Ec::new(self.io);
-        match self.policy.get() {
+    pub fn apply(&self) -> io::Result<()> {
+        if self.applied.replace(true) { return Ok(()); }
+        if self.ec.is_faulted() { return Err(io::Error::other("faulted EC: exit writes suppressed")); }
+        let ec = self.ec;
+        match self.policy {
             // Hand control back to the EC's own automatic control.
             ExitPolicy::Auto => {
-                enter_auto(&ec);
+                enter_auto(ec)?;
             }
             // Latch manual control and pin both fans at maximum.
             ExitPolicy::MaxFans => {
-                ec.write(OMCC, MANUAL_MODE);
-                ec.write(XSS1, FAN_MAX_DUTY);
-                ec.write(XSS2, FAN_MAX_DUTY);
+                ec.write(OMCC, MANUAL_MODE)?;
+                ec.write(XSS1, FAN_MAX_DUTY)?;
+                ec.write(XSS2, FAN_MAX_DUTY)?;
             }
             // Leave the EC exactly as the loop left it.
             ExitPolicy::Keep => {}
         }
+        Ok(())
     }
 }
 
 impl<'a> Drop for ExitGuard<'a> {
     fn drop(&mut self) {
-        self.apply();
+        if let Err(e) = self.apply() { eprintln!("EC exit policy: {e}"); }
     }
 }
 
 /// Enables manual fan control (latch) - required for duty writes to take effect.
-pub fn enter_manual(ec: &Ec) {
-    ec.write(OMCC, MANUAL_MODE);
+pub fn enter_manual(ec: &Ec) -> io::Result<()> {
+    ec.write(OMCC, MANUAL_MODE)
 }
 
 /// Hands fan control back to the EC's own automatic control.
-pub fn enter_auto(ec: &Ec) {
-    ec.write(XSS1, AUTO_DUTY);
-    ec.write(XSS2, AUTO_DUTY);
-    ec.write(OMCC, AUTO_MODE);
+pub fn enter_auto(ec: &Ec) -> io::Result<()> {
+    ec.write(XSS1, AUTO_DUTY)?;
+    ec.write(XSS2, AUTO_DUTY)?;
+    ec.write(OMCC, AUTO_MODE)
 }
 
 /// One control step. Returns the duties that were written.
 ///
-/// Without `unify` (the default) each fan follows its own curve on its own sensor: the CPU
+/// Without `unify` each fan follows its own curve on its own sensor: the CPU
 /// fan tracks `0x5A`, the GPU fan `0xB7`. With `unify` both are driven from the hotter of
-/// the two through the CPU curve, which keeps the whole region cool as one unit.
-pub fn step(ec: &Ec, cfg: &Config, t: &Telemetry, unify: bool) -> (f64, f64) {
+/// the two through the CPU curve (the default), cooling the whole region as one unit.
+pub fn step(ec: &Ec, cfg: &Config, t: &Telemetry, unify: bool) -> io::Result<(f64, f64)> {
+    if !t.plausible() {
+        enter_manual(ec)?;
+        ec.write(XSS1, FAN_MAX_DUTY)?;
+        ec.write(XSS2, FAN_MAX_DUTY)?;
+        return Ok((100.0, 100.0));
+    }
     let cpu_t = t.cpu_temp as f64;
     // 0xB7 reads 0 while the dGPU sleeps in P8; fall back to the CPU sensor then.
     let gpu_t = if t.gpu_temp > 0 { t.gpu_temp as f64 } else { cpu_t };
@@ -141,8 +160,8 @@ pub fn step(ec: &Ec, cfg: &Config, t: &Telemetry, unify: bool) -> (f64, f64) {
         gpu_duty = 100.0;
     }
 
-    ec.write(XSS1, cpu_duty.round().clamp(0.0, 100.0) as u8);
-    ec.write(XSS2, gpu_duty.round().clamp(0.0, 100.0) as u8);
+    ec.write(XSS1, cpu_duty.round().clamp(0.0, 100.0) as u8)?;
+    ec.write(XSS2, gpu_duty.round().clamp(0.0, 100.0) as u8)?;
 
     if cpu_duty >= 30.0 && t.cpu_rpm == 0 {
         eprintln!("warn: cpu duty {cpu_duty:.0}% but tacho reads 0 RPM - stalled?");
@@ -151,48 +170,39 @@ pub fn step(ec: &Ec, cfg: &Config, t: &Telemetry, unify: bool) -> (f64, f64) {
         eprintln!("warn: gpu duty {gpu_duty:.0}% but tacho reads 0 RPM - stalled?");
     }
 
-    (cpu_duty, gpu_duty)
+    Ok((cpu_duty, gpu_duty))
 }
 
 /// The control loop. Runs until `shared` is asked to shut down, honouring `shared.mode`:
 /// in [`Mode::Curve`] it drives the fans from the curve, in [`Mode::Auto`] it hands
-/// control back to the EC. Always restores auto on exit.
+/// control back to the EC. Applies the configured exit policy only on healthy transport.
 pub fn run(io: &dyn IoBackend, cfg: &Config, shared: &Shared, verbose: bool) {
     let ec = Ec::new(io);
-    let guard = ExitGuard::new(io, cfg.exit_policy);
+    let guard = ExitGuard::new(&ec, cfg.exit_policy);
     let mut driving = false;
 
     if verbose {
         println!(
-            "paveconel: curve control at {} ms poll; Ctrl-C restores EC auto.",
+            "paveconel: curve control at {} ms poll; Ctrl-C applies configured exit policy.",
             cfg.poll_interval_ms
         );
     }
 
     while !shared.is_shutting_down() {
-        // A failed EC read must not become a 0 temperature: retry once, and if it still
-        // fails skip the tick entirely, leaving the last written duty in place.
-        let mut t = match Telemetry::sample(&ec).or_else(|| Telemetry::sample(&ec)) {
-            Some(t) => t,
-            None => {
-                if verbose {
-                    println!("paveconel: EC read failed twice; holding current duty.");
-                }
-                std::thread::sleep(Duration::from_millis(cfg.poll_interval_ms));
-                continue;
+        let mut t = match Telemetry::sample(&ec) {
+            Ok(t) => t,
+            Err(e) => {
+                shared.set_error(format!("EC transport fault; stopped without further writes: {e}"));
+                eprintln!("{}", shared.error());
+                break;
             }
         };
 
-        // Serve a pending one-shot register access from the UI, if any.
+        // Register writes are deliberately unavailable, even if posted internally.
         if let Some(req) = shared.take_reg_request() {
-            let read_back = match req.write {
-                Some(v) => {
-                    ec.write(req.reg, v);
-                    ec.read(req.reg)
-                }
-                None => ec.read(req.reg),
-            };
-            shared.set_reg_response((req.reg, req.write, read_back));
+            let rb = if req.write.is_none() { ec.read(req.reg).ok() } else { None };
+            shared.set_reg_response((req.reg, req.write, rb));
+            if ec.is_faulted() { break; }
         }
 
         // Pick up live curve edits from the UI.
@@ -200,13 +210,22 @@ pub fn run(io: &dyn IoBackend, cfg: &Config, shared: &Shared, verbose: bool) {
         cfg_now.cpu.function = shared.curve_cpu();
         cfg_now.gpu.function = shared.curve_gpu();
 
-        match shared.mode() {
+        // Bad telemetry must not select EC auto or reduce cooling. The same checked
+        // step forces manual + maximum, even if a client requested auto.
+        let mode = if t.plausible() { shared.mode() } else {
+            shared.set_error("implausible EC telemetry; forcing maximum fans");
+            Mode::Curve
+        };
+        match mode {
             Mode::Curve => {
                 if !driving {
-                    enter_manual(&ec);
+                    if let Err(e) = enter_manual(&ec) { shared.set_error(e.to_string()); break; }
                     driving = true;
                 }
-                let (cpu_duty, gpu_duty) = step(&ec, &cfg_now, &t, shared.unify());
+                let (cpu_duty, gpu_duty) = match step(&ec, &cfg_now, &t, shared.unify()) {
+                    Ok(d) => d,
+                    Err(e) => { shared.set_error(e.to_string()); break; }
+                };
                 t.cpu_set = cpu_duty.round().clamp(0.0, 100.0) as u8;
                 t.gpu_set = gpu_duty.round().clamp(0.0, 100.0) as u8;
                 if verbose {
@@ -219,7 +238,7 @@ pub fn run(io: &dyn IoBackend, cfg: &Config, shared: &Shared, verbose: bool) {
             }
             Mode::Auto => {
                 if driving {
-                    enter_auto(&ec);
+                    if let Err(e) = enter_auto(&ec) { shared.set_error(e.to_string()); break; }
                     driving = false;
                     if verbose {
                         println!("paveconel: control handed back to the EC (auto).");
@@ -235,13 +254,10 @@ pub fn run(io: &dyn IoBackend, cfg: &Config, shared: &Shared, verbose: bool) {
         std::thread::sleep(Duration::from_millis(cfg.poll_interval_ms));
     }
 
-    // A client-requested stop exits into EC auto rather than the configured latch.
-    if shared.exit_as_auto() {
-        guard.set_policy(ExitPolicy::Auto);
-    }
+    // STOP uses the configured exit policy; it must not silently select unsafe EC auto.
 
     drop(guard); // explicit exit-policy write before returning
-    if verbose {
+    if verbose && !ec.is_faulted() {
         let what = match cfg.exit_policy {
             ExitPolicy::Auto => "EC auto fan control restored",
             ExitPolicy::MaxFans => "fans left at maximum (manual latch)",

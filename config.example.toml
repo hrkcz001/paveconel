@@ -9,9 +9,9 @@ poll_interval_ms = 1000
 
 [fan]
 # true = drive BOTH fans from the hotter of the two sensors instead of giving each
-# fan its own curve on its own sensor. Off by default: the CPU and GPU fans are
-# driven independently on this board.
-unify = false
+# fan its own curve on its own sensor. On by default to cool the whole region.
+# Set false for independent CPU/GPU curves.
+unify = true
 
 [fan.cpu]
 # ~25% at 60 C, ~52% at 70 C, 100% at 80 C
@@ -37,7 +37,7 @@ stall_rpm = 700        # warn if a fan is commanded >= 30% but tacho reports bel
 driver = "winring0"
 
 [on_exit]
-# What to write to the EC when control stops:
+# What to write when control stops with a healthy transport (faults suppress all I/O):
 #   "auto"     -> hand control back to the EC  (0x2C=0xFF, 0x2D=0xFF, 0x62=0x00)
 #   "max_fans" -> latch manual control and leave both fans at 100%
 #   "keep"     -> leave whatever the loop last wrote
